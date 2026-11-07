@@ -16,7 +16,7 @@ jobs:
           POSTGRES_DB: ting_test
         ports: ['5432:5432']
         options: >-
-          --health-cmd 'pg_isready -U ting -d ting_test'
+          --health-cmd "pg_isready -U ting -d ting_test"
           --health-interval 5s --health-timeout 3s --health-retries 10
     env:
       TING_TEST_DATABASE_URL: postgres://ting:ting-test-only@localhost:5432/ting_test?sslmode=disable
