@@ -1,0 +1,69 @@
+name: ting
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ting
+      POSTGRES_DB: ting
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ting -d ting"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+    cpus: 1
+  ting:
+    image: ${TING_IMAGE:-ghcr.io/klaraalabs/ting:edge}
+    environment:
+      DATABASE_URL: postgres://ting:${POSTGRES_PASSWORD}@postgres:5432/ting?sslmode=disable
+      TING_BIND_ADDRESS: 0.0.0.0:8080
+      TING_ALLOW_LOCAL_HTTP: ${TING_ALLOW_LOCAL_HTTP:-true}
+      TING_CREDENTIALS_ENCRYPTION_KEY: ${TING_CREDENTIALS_ENCRYPTION_KEY:-}
+      TING_TRUSTED_PROXIES: ${TING_TRUSTED_PROXIES:-}
+      TING_ADMIN_ENABLED: ${TING_ADMIN_ENABLED:-true}
+      TING_ADMIN_ORIGIN: ${TING_ADMIN_ORIGIN:-https://localhost:8080}
+      TING_ADMIN_SESSION_TTL: ${TING_ADMIN_SESSION_TTL:-8h}
+      TING_WORKER_CONCURRENCY: ${TING_WORKER_CONCURRENCY:-4}
+      TING_WORKER_POLL_INTERVAL: ${TING_WORKER_POLL_INTERVAL:-1s}
+      TING_DELIVERY_LEASE_DURATION: ${TING_DELIVERY_LEASE_DURATION:-1m}
+      TING_DELIVERY_ATTEMPT_TIMEOUT: ${TING_DELIVERY_ATTEMPT_TIMEOUT:-15s}
+      TING_DELIVERY_MAX_ATTEMPTS: ${TING_DELIVERY_MAX_ATTEMPTS:-8}
+      TING_DELIVERY_RETRY_BASE: ${TING_DELIVERY_RETRY_BASE:-1s}
+      TING_DELIVERY_RETRY_MAX: ${TING_DELIVERY_RETRY_MAX:-5m}
+      TING_DELIVERY_TTL: ${TING_DELIVERY_TTL:-24h}
+      TING_SHUTDOWN_GRACE: ${TING_SHUTDOWN_GRACE:-15s}
+      TING_QUEUE_MAX_PENDING: ${TING_QUEUE_MAX_PENDING:-100000}
+      TING_QUEUE_MAX_PENDING_PER_APP: ${TING_QUEUE_MAX_PENDING_PER_APP:-10000}
+      TING_MAX_TARGETS_PER_SEND: ${TING_MAX_TARGETS_PER_SEND:-1000}
+      TING_APP_SENDS_PER_MINUTE: ${TING_APP_SENDS_PER_MINUTE:-120}
+      TING_REQUESTS_PER_MINUTE: ${TING_REQUESTS_PER_MINUTE:-120}
+      TING_RATE_LIMIT_MAX_PEERS: ${TING_RATE_LIMIT_MAX_PEERS:-10000}
+      TING_MAX_CONCURRENT_REQUESTS: ${TING_MAX_CONCURRENT_REQUESTS:-64}
+      TING_MAX_REQUEST_BYTES: ${TING_MAX_REQUEST_BYTES:-1048576}
+      TING_REQUEST_TIMEOUT: ${TING_REQUEST_TIMEOUT:-10s}
+      TING_RETENTION: ${TING_RETENTION:-168h}
+      TING_RETENTION_INTERVAL: ${TING_RETENTION_INTERVAL:-1m}
+      TING_RETENTION_BATCH_SIZE: ${TING_RETENTION_BATCH_SIZE:-100}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: ${TING_CONTAINER_STOP_GRACE:-25s}
+    mem_limit: 256m
+    cpus: 1
+volumes:
+  postgres_data:

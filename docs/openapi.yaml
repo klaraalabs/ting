@@ -1,0 +1,1374 @@
+openapi: 3.1.0
+info:
+  title: Ting API
+  version: 0.2.0
+  description: >-
+    Sends persist notifications, fixed installation targets, and delivery deadlines.
+    Workers send to APNs over HTTP/2 and to FCM through the Firebase Admin SDK.
+    Provider acceptance does not imply device display. Pending work expires after its deadline.
+    New sends share instance and App queue capacities and a persistent per-App send budget.
+    Non-health requests also have configurable rate, concurrency, body, and deadline limits.
+    Retention removes completed notification history and its idempotency keys (seven days by default).
+    Responses include a server-generated X-Request-Id for correlation with redacted HTTP failure logs.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      operationId: liveness
+      responses:
+        '200':
+          description: Process is alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /readyz:
+    get:
+      operationId: readiness
+      responses:
+        '200':
+          description: Startup succeeded and PostgreSQL is reachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/notifications:
+    post:
+      operationId: sendNotification
+      security: [{ AppToken: [] }]
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string, minLength: 1, maxLength: 200 }
+          description: App-scoped key. Different content under the same key conflicts. Accepted replay bypasses queue and App send budgets. After retention removes the notification, this key can create a new send.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Send' }
+      responses:
+        '202':
+          description: Committed to PostgreSQL. Does not imply provider acceptance.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id: { type: string, format: uuid }
+                  status: { type: string, const: queued }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413':
+          description: Request body or push payload is too large, or installation fan-out exceeds the configured target limit (fanout_too_large).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/SendLimited' }
+        '503': { $ref: '#/components/responses/Overloaded' }
+        '504': { $ref: '#/components/responses/RequestTimeout' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/notifications/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/NotificationID' }
+    get:
+      operationId: getNotification
+      description: Notification history is available until retention removes it; subsequent reads return 404.
+      security: [{ AppToken: [] }]
+      responses:
+        '200':
+          description: App-scoped counts. Provider acceptance is not device delivery.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status, counts, errors]
+                properties:
+                  id: { type: string, format: uuid }
+                  status: { type: string, enum: [queued, complete] }
+                  counts:
+                    type: object
+                    required: [queued, accepted, failed, skipped]
+                    properties:
+                      queued: { type: integer, minimum: 0 }
+                      accepted: { type: integer, minimum: 0 }
+                      failed: { type: integer, minimum: 0 }
+                      skipped: { type: integer, minimum: 0 }
+                  errors:
+                    type: object
+                    additionalProperties: { type: integer, minimum: 0 }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/installations/{installationId}:
+    parameters:
+      - in: path
+        name: installationId
+        required: true
+        schema: { type: string, format: uuid }
+      - in: header
+        name: X-Ting-App-Id
+        required: true
+        schema: { type: string }
+    put:
+      operationId: registerInstallation
+      description: >-
+        Persist the proposed installationToken and generation before HTTP. Exact replay
+        requires the same user and registration settings and changes no state. Each new
+        PUT/DELETE increases the shared generation. Reassociation and reactivation require
+        a new credential. After ownership verification, lower generations return
+        installation_superseded and conflicting reuse returns installation_generation_conflict.
+        Invalid installation proof returns installation_credential_invalid; invalid identity
+        proof returns unauthorized. Native token changes during an unresolved request become
+        a later mutation on the same installation UUID.
+        Transferring a native token to another UUID permanently supersedes previous UUIDs
+        for that token within the App, platform, and APNs environment, including inactive
+        associations. All subsequent PUTs to a superseded UUID return installation_superseded
+        after ownership verification, regardless of generation or proposed token. DELETE
+        remains available for cleanup. Clients must retain their journal and surface an
+        unexplained conflict rather than automatically allocating a new UUID.
+      security: [{ IdentityJWT: [] }]
+      parameters:
+        - in: header
+          name: X-Ting-Installation-Token
+          description: Current credential required for new mutations of an existing installation. Exact replay may prove ownership with the pre-saved proposed credential in the body.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  additionalProperties: false
+                  required: [platform, pushToken, apnsEnvironment, installationToken, generation]
+                  properties:
+                    platform: { type: string, const: ios }
+                    pushToken: { type: string, minLength: 2, maxLength: 512, pattern: '^(?:[0-9a-fA-F]{2})+$' }
+                    apnsEnvironment: { type: string, enum: [sandbox, production] }
+                    installationToken: { $ref: '#/components/schemas/InstallationCredential' }
+                    generation: { $ref: '#/components/schemas/InstallationGeneration' }
+                - type: object
+                  additionalProperties: false
+                  required: [platform, pushToken, installationToken, generation]
+                  properties:
+                    platform: { type: string, const: android }
+                    pushToken: { type: string, minLength: 1, maxLength: 4096 }
+                    installationToken: { $ref: '#/components/schemas/InstallationCredential' }
+                    generation: { $ref: '#/components/schemas/InstallationGeneration' }
+      responses:
+        '200': { $ref: '#/components/responses/Registered' }
+        '201': { $ref: '#/components/responses/Registered' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: revokeInstallation
+      security: [{ InstallationToken: [] }]
+      parameters:
+        - in: header
+          name: X-Ting-Installation-Generation
+          required: true
+          schema: { $ref: '#/components/schemas/InstallationGeneration' }
+          description: Persist a generation above all prepared PUTs before sending. Retry the same DELETE generation after a lost response.
+      responses:
+        '204': { description: Association revoked. Repeated valid requests with the same generation are idempotent. Older PUTs cannot reactivate it. }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /admin/api/v1/session:
+    servers:
+      - url: https://localhost:8080
+        description: Replace with TING_ADMIN_ORIGIN. HTTPS through a trusted reverse proxy is required.
+    post:
+      operationId: operatorLogin
+      description: >-
+        No public signup. Requires an operator created by the CLI. Exact configured Origin
+        and X-Ting-CSRF login header are required. Authorization headers are rejected.
+        Login rotates the presented session cookie. Request body is limited to 4 KiB.
+      parameters:
+        - { $ref: '#/components/parameters/AdminOrigin' }
+        - in: header
+          name: X-Ting-CSRF
+          required: true
+          schema: { type: string, const: login }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [username, password]
+              properties:
+                username: { type: string, minLength: 3, maxLength: 64 }
+                password:
+                  type: string
+                  format: password
+                  minLength: 15
+                  maxLength: 128
+                  description: At most 512 UTF-8 bytes, without NUL. No trimming or normalization.
+      responses:
+        '200':
+          description: Session created. Sets a Secure, HttpOnly, SameSite=Strict host-only cookie.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorSession' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { description: Admin HTTP endpoints disabled. }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '429':
+          description: Login or request budget exhausted.
+          headers:
+            Retry-After: { schema: { type: integer, const: 60 } }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: operatorSession
+      security: [{ OperatorCookie: [] }]
+      description: Returns the operator, absolute expiry, and session-bound CSRF token. Never returns the session bearer token. Not cacheable.
+      responses:
+        '200':
+          description: Current operator session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorSession' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { description: Admin HTTP endpoints disabled. }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: operatorLogout
+      security: [{ OperatorCookie: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/AdminOrigin' }
+        - in: header
+          name: X-Ting-CSRF
+          required: true
+          description: csrfToken from this session's login or GET response.
+          schema: { type: string }
+      responses:
+        '204': { description: Session revoked and cookie expired. }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { description: Admin HTTP endpoints disabled. }
+        default: { $ref: '#/components/responses/Error' }
+  "/admin/api/v1/apps":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    get:
+      operationId: listManagedApps
+      description: Newest Apps first. All operators have instance-wide access.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Newest Apps first. All operators have instance-wide access.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      "$ref": "#/components/schemas/ManagedApp"
+                  nextOffset:
+                    type:
+                    - integer
+                    - 'null'
+                    minimum: 0
+                required:
+                - items
+                - nextOffset
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/ManagementLimit"
+      - "$ref": "#/components/parameters/ManagementOffset"
+    post:
+      operationId: createManagedApp
+      description: Create an enabled App without implicitly issuing credentials. Duplicate
+        slug returns 409.
+      security:
+      - OperatorCookie: []
+      responses:
+        '201':
+          description: Create an enabled App without implicitly issuing credentials.
+            Duplicate slug returns 409.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ManagedApp"
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/CreateApp"
+  "/admin/api/v1/apps/{appId}":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    get:
+      operationId: getManagedApp
+      description: App metadata, including disabled Apps.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: App metadata, including disabled Apps.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ManagedApp"
+        default:
+          "$ref": "#/components/responses/Error"
+    patch:
+      operationId: updateManagedApp
+      description: Rename or enable/disable an App. Disabling cancels queued deliveries;
+        enabling does not resume them.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Rename or enable/disable an App. Disabling cancels queued deliveries;
+            enabling does not resume them.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ManagedApp"
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/UpdateApp"
+  "/admin/api/v1/apps/{appId}/tokens":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    get:
+      operationId: listAppTokens
+      description: Masked token metadata only, including revoked tokens.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Masked token metadata only, including revoked tokens.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      "$ref": "#/components/schemas/AppTokenMetadata"
+                  nextOffset:
+                    type:
+                    - integer
+                    - 'null'
+                    minimum: 0
+                required:
+                - items
+                - nextOffset
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/ManagementLimit"
+      - "$ref": "#/components/parameters/ManagementOffset"
+    post:
+      operationId: issueAppToken
+      description: Raw sender token is returned only on issuance. This operation is
+        not idempotent.
+      security:
+      - OperatorCookie: []
+      responses:
+        '201':
+          description: Raw sender token is returned only on issuance. This operation
+            is not idempotent.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/IssuedAppToken"
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+              required:
+              - label
+              additionalProperties: false
+  "/admin/api/v1/apps/{appId}/tokens/{tokenId}":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    - in: path
+      name: tokenId
+      required: true
+      schema:
+        type: string
+        format: uuid
+    delete:
+      operationId: revokeAppToken
+      description: Revoke an App-scoped token. Repeated revocation returns 204; other-App
+        or missing token returns 404.
+      security:
+      - OperatorCookie: []
+      responses:
+        '204':
+          description: Revoke an App-scoped token. Repeated revocation returns 204;
+            other-App or missing token returns 404.
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+  "/admin/api/v1/apps/{appId}/identity-secrets":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    get:
+      operationId: listIdentitySecrets
+      description: Key IDs and lifecycle metadata only; no secrets or ciphertext.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Key IDs and lifecycle metadata only; no secrets or ciphertext.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      "$ref": "#/components/schemas/IdentityMetadata"
+                  nextOffset:
+                    type:
+                    - integer
+                    - 'null'
+                    minimum: 0
+                required:
+                - items
+                - nextOffset
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/ManagementLimit"
+      - "$ref": "#/components/parameters/ManagementOffset"
+    post:
+      operationId: issueIdentitySecret
+      description: One-time identity secret. Old keys remain valid until explicitly
+        retired. Not idempotent.
+      security:
+      - OperatorCookie: []
+      responses:
+        '201':
+          description: One-time identity secret. Old keys remain valid until explicitly
+            retired. Not idempotent.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/IssuedIdentitySecret"
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {}
+              additionalProperties: false
+  "/admin/api/v1/apps/{appId}/identity-secrets/{kid}":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    - in: path
+      name: kid
+      required: true
+      schema:
+        type: string
+        format: uuid
+    delete:
+      operationId: retireIdentitySecret
+      description: Retire an App-scoped identity key. Existing JWTs signed with that
+        key stop authenticating.
+      security:
+      - OperatorCookie: []
+      responses:
+        '204':
+          description: Retire an App-scoped identity key. Existing JWTs signed with
+            that key stop authenticating.
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+  "/admin/api/v1/apps/{appId}/apns":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    get:
+      operationId: getAPNsConfiguration
+      description: Safe APNs metadata only. Status is not proof of authorization or
+        device delivery.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Safe APNs metadata only. Status is not proof of authorization
+            or device delivery.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/APNsConfigurationStatus"
+        default:
+          "$ref": "#/components/responses/Error"
+    put:
+      operationId: configureAPNs
+      description: Upload/replace encrypted APNs configuration. Both environments update
+        atomically. Body limit 512 KiB; PEM limit 64 KiB.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Upload/replace encrypted APNs configuration. Both environments
+            update atomically. Body limit 512 KiB; PEM limit 64 KiB.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ProviderConfigured"
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ConfigureAPNs"
+    delete:
+      operationId: removeAPNsConfiguration
+      description: Remove the selected configuration; already absent configuration returns
+        204.
+      security:
+      - OperatorCookie: []
+      responses:
+        '204':
+          description: Remove the selected configuration; already absent configuration
+            returns 204.
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+      - in: query
+        name: environment
+        required: true
+        schema:
+          type: string
+          enum:
+          - sandbox
+          - production
+          - both
+  "/admin/api/v1/apps/{appId}/fcm":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    get:
+      operationId: getFCMConfiguration
+      description: Safe FCM metadata only. No configuration returns credential null.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Safe FCM metadata only. No configuration returns credential null.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/FCMConfigurationStatus"
+        default:
+          "$ref": "#/components/responses/Error"
+    put:
+      operationId: configureFCM
+      description: Upload/replace encrypted service-account configuration. Body limit
+        512 KiB; service-account JSON limit 64 KiB.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Upload/replace encrypted service-account configuration. Body
+            limit 512 KiB; service-account JSON limit 64 KiB.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ProviderConfigured"
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ConfigureFCM"
+    delete:
+      operationId: removeFCMConfiguration
+      description: Remove FCM configuration. Already absent configuration returns 204.
+      security:
+      - OperatorCookie: []
+      responses:
+        '204':
+          description: Remove FCM configuration. Already absent configuration returns
+            204.
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+  "/admin/api/v1/apps/{appId}/installations":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    get:
+      operationId: listManagedInstallations
+      description: Newest last-seen first. Omits user IDs, push tokens, credentials,
+        and ciphertext.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Newest last-seen first. Omits user IDs, push tokens, credentials,
+            and ciphertext.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      "$ref": "#/components/schemas/InstallationMetadata"
+                  nextOffset:
+                    type:
+                    - integer
+                    - 'null'
+                    minimum: 0
+                required:
+                - items
+                - nextOffset
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/ManagementLimit"
+      - "$ref": "#/components/parameters/ManagementOffset"
+  "/admin/api/v1/apps/{appId}/test-notifications":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    post:
+      operationId: sendTestNotification
+      description: Queue a fixed Ting test alert to exactly one active registered installation.
+        Missing/other-App installation returns 404; inactive installation, disabled
+        App, or missing provider configuration returns 409. Provider outcomes are asynchronous.
+        Shares queue capacities and the persistent App send budget with public sends.
+      security:
+      - OperatorCookie: []
+      responses:
+        '202':
+          description: Queue a fixed Ting test alert to exactly one active registered
+            installation. Missing/other-App installation returns 404; inactive installation,
+            disabled App, or missing provider configuration returns 409. Provider outcomes
+            are asynchronous.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/QueuedNotification"
+        '429': { $ref: '#/components/responses/SendLimited' }
+        '503': { $ref: '#/components/responses/Overloaded' }
+        '504': { $ref: '#/components/responses/RequestTimeout' }
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/AdminOrigin"
+      - "$ref": "#/components/parameters/AdminCSRF"
+      - in: header
+        name: Idempotency-Key
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description: App-scoped namespace shared with public sends. Same test replays;
+          another target or send conflicts. After retention removes the notification,
+          this key can create a new send.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/TestNotification"
+  "/admin/api/v1/apps/{appId}/notifications":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    get:
+      operationId: listManagedNotifications
+      description: Newest sends first, with counts and safe errors. Omits payloads and
+        recipient identities.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: Newest sends first, with counts and safe errors. Omits payloads
+            and recipient identities.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      "$ref": "#/components/schemas/RecentNotification"
+                  nextOffset:
+                    type:
+                    - integer
+                    - 'null'
+                    minimum: 0
+                required:
+                - items
+                - nextOffset
+        default:
+          "$ref": "#/components/responses/Error"
+      parameters:
+      - "$ref": "#/components/parameters/ManagementLimit"
+      - "$ref": "#/components/parameters/ManagementOffset"
+  "/admin/api/v1/apps/{appId}/notifications/{notificationId}":
+    servers:
+    - url: https://localhost:8080
+      description: Replace with TING_ADMIN_ORIGIN; requires HTTPS through a trusted
+        reverse proxy.
+    parameters:
+    - "$ref": "#/components/parameters/ManagedAppID"
+    - in: path
+      name: notificationId
+      required: true
+      schema:
+        type: string
+        format: uuid
+    get:
+      operationId: getManagedNotification
+      description: App-scoped send status, including test sends and disabled Apps. Accepted
+        is provider acceptance, not device display.
+      security:
+      - OperatorCookie: []
+      responses:
+        '200':
+          description: App-scoped send status, including test sends and disabled Apps.
+            Accepted is provider acceptance, not device display.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ManagedNotificationStatus"
+        default:
+          "$ref": "#/components/responses/Error"
+components:
+  securitySchemes:
+    OperatorCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-ting_session
+      description: Operator-only server-side session. App bearer tokens are never accepted for management.
+    AppToken:
+      type: http
+      scheme: bearer
+      description: Private ting_sk_ token for one App. Sending and status only.
+    IdentityJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: HS256 with kid, App issuer/audience, subject, iat, exp; lifetime at most 300 seconds.
+    InstallationToken:
+      type: http
+      scheme: bearer
+      description: Private ting_ik_ credential scoped to one App and installation.
+  parameters:
+    ManagedAppID:
+      in: path
+      name: appId
+      required: true
+      schema:
+        type: string
+    AdminCSRF:
+      in: header
+      name: X-Ting-CSRF
+      required: true
+      schema:
+        type: string
+      description: Session-bound csrfToken returned by operator login or session inspection.
+    ManagementLimit:
+      in: query
+      name: limit
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    ManagementOffset:
+      in: query
+      name: offset
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 100000
+        default: 0
+    AdminOrigin:
+      in: header
+      name: Origin
+      required: true
+      description: Must equal TING_ADMIN_ORIGIN exactly.
+      schema: { type: string, format: uri }
+    NotificationID:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+  schemas:
+    ManagedApp:
+      type: object
+      properties:
+        appId:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        enabled:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+      required:
+      - appId
+      - name
+      - enabled
+      - createdAt
+    CreateApp:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: At most 200 UTF-8 bytes, without NUL.
+        slug:
+          type: string
+          maxLength: 100
+          description: Optional lowercase, hyphenated slug.
+      required:
+      - name
+      additionalProperties: false
+    UpdateApp:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        enabled:
+          type: boolean
+      additionalProperties: false
+      minProperties: 1
+    IssuedAppToken:
+      type: object
+      properties:
+        tokenId:
+          type: string
+          format: uuid
+        token:
+          type: string
+        suffix:
+          type: string
+      required:
+      - tokenId
+      - token
+      - suffix
+    AppTokenMetadata:
+      type: object
+      properties:
+        tokenId:
+          type: string
+          format: uuid
+        label:
+          type: string
+        suffix:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        lastUsedAt:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        revokedAt:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - tokenId
+      - label
+      - suffix
+      - createdAt
+      - lastUsedAt
+      - revokedAt
+    IssuedIdentitySecret:
+      type: object
+      properties:
+        kid:
+          type: string
+          format: uuid
+        secret:
+          type: string
+      required:
+      - kid
+      - secret
+    IdentityMetadata:
+      type: object
+      properties:
+        kid:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        retiredAt:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - kid
+      - createdAt
+      - retiredAt
+    ConfigureAPNs:
+      type: object
+      properties:
+        environment:
+          type: string
+          enum:
+          - sandbox
+          - production
+          - both
+        bundleId:
+          type: string
+        teamId:
+          type: string
+          pattern: "^[A-Z0-9]{10}$"
+        keyId:
+          type: string
+          pattern: "^[A-Z0-9]{10}$"
+        privateKey:
+          type: string
+          maxLength: 65536
+          description: PKCS#8 P-256 PEM. Never returned by reads.
+      required:
+      - environment
+      - bundleId
+      - teamId
+      - keyId
+      - privateKey
+      additionalProperties: false
+    APNsMetadata:
+      type: object
+      properties:
+        environment:
+          type: string
+          enum:
+          - sandbox
+          - production
+        bundleId:
+          type: string
+        teamId:
+          type: string
+        keyId:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+      - environment
+      - bundleId
+      - teamId
+      - keyId
+      - updatedAt
+    APNsConfigurationStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - not_configured
+          - configured_untested
+        credentials:
+          type: array
+          maxItems: 2
+          items:
+            "$ref": "#/components/schemas/APNsMetadata"
+      required:
+      - status
+      - credentials
+    ConfigureFCM:
+      type: object
+      properties:
+        projectId:
+          type: string
+        serviceAccount:
+          type: object
+          description: Server service-account JSON object, at most 64 KiB of raw JSON.
+            Not a JSON string or google-services.json. Requires matching project_id, RSA
+            private_key, service-account client_email, type service_account, and Google
+            token_uri.
+          additionalProperties: true
+      required:
+      - projectId
+      - serviceAccount
+      additionalProperties: false
+    FCMMetadata:
+      type: object
+      properties:
+        projectId:
+          type: string
+        clientEmail:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+      - projectId
+      - clientEmail
+      - updatedAt
+    FCMConfigurationStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - not_configured
+          - configured_untested
+        credential:
+          anyOf:
+          - "$ref": "#/components/schemas/FCMMetadata"
+          - type: 'null'
+      required:
+      - status
+      - credential
+    ProviderConfigured:
+      type: object
+      properties:
+        status:
+          type: string
+          const: configured_untested
+      required:
+      - status
+    InstallationMetadata:
+      type: object
+      properties:
+        installationId:
+          type: string
+          format: uuid
+        platform:
+          type: string
+          enum:
+          - ios
+          - android
+        apnsEnvironment:
+          type: string
+          enum:
+          - sandbox
+          - production
+        active:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        lastSeenAt:
+          type: string
+          format: date-time
+        tokenUpdatedAt:
+          type: string
+          format: date-time
+        invalidatedAt:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - installationId
+      - platform
+      - active
+      - createdAt
+      - lastSeenAt
+      - tokenUpdatedAt
+      - invalidatedAt
+    ManagedNotificationStatus:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+          - queued
+          - complete
+        counts:
+          type: object
+          properties:
+            queued:
+              type: integer
+              minimum: 0
+            accepted:
+              type: integer
+              minimum: 0
+            failed:
+              type: integer
+              minimum: 0
+            skipped:
+              type: integer
+              minimum: 0
+          required:
+          - queued
+          - accepted
+          - failed
+          - skipped
+        errors:
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 1
+      required:
+      - id
+      - status
+      - counts
+      - errors
+    RecentNotification:
+      allOf:
+      - "$ref": "#/components/schemas/ManagedNotificationStatus"
+      - type: object
+        properties:
+          createdAt:
+            type: string
+            format: date-time
+          source:
+            type: string
+            enum:
+            - api
+            - operator_test
+        required:
+        - createdAt
+        - source
+    TestNotification:
+      type: object
+      properties:
+        installationId:
+          type: string
+          format: uuid
+      required:
+      - installationId
+      additionalProperties: false
+    QueuedNotification:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          const: queued
+      required:
+      - id
+      - status
+    InstallationGeneration:
+      type: integer
+      minimum: 1
+      maximum: 9007199254740991
+      description: Durable per-installation mutation counter shared by PUT and DELETE. New mutations increase it; exact retries retain it. Lower generations and conflicting reuse are rejected after ownership verification.
+    InstallationCredential:
+      type: string
+      pattern: '^ting_ik_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+      description: Cryptographically random 32-byte credential in canonical unpadded base64url. Securely persist the proposed value before HTTP. Creation adopts it; reassociation/reactivation require a different value. Current-generation exact replay with the same user/settings can use it to recover a lost response, but cannot reactivate an inactive installation.
+    OperatorSession:
+      type: object
+      required: [operator, expiresAt, csrfToken]
+      properties:
+        operator:
+          type: object
+          required: [id, username]
+          properties:
+            id: { type: string, format: uuid }
+            username: { type: string }
+        expiresAt: { type: string, format: date-time }
+        csrfToken: { type: string }
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, ready] }
+    Send:
+      type: object
+      additionalProperties: false
+      required: [userIds, notification]
+      description: APNs and FCM message content must each serialize to at most 4096 bytes.
+      properties:
+        userIds:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+            description: Nonblank, opaque identifier, limited to 256 UTF-8 bytes.
+        notification:
+          type: object
+          additionalProperties: false
+          required: [title, body]
+          properties:
+            title: { type: string, minLength: 1 }
+            body: { type: string, minLength: 1 }
+        data:
+          type: object
+          additionalProperties: { type: string }
+          description: Reserved keys aps, from, gcm, google, message_type, collapse_key and prefixes google. and gcm. are rejected.
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+  responses:
+    SendLimited:
+      description: Peer rate limit (rate_limited), App queue capacity (app_queue_full), or persistent App send budget (app_send_rate_limited) exceeded. No new notification is committed.
+      headers:
+        Retry-After:
+          description: Suggested backoff in seconds; capacity is not guaranteed after this delay.
+          schema: { type: integer, const: 60 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Overloaded:
+      description: Instance queue capacity (queue_full) or HTTP concurrency capacity (server_busy) exceeded. No new notification is committed.
+      headers:
+        Retry-After:
+          description: One second for server_busy; 60 seconds for queue_full.
+          schema: { type: integer, enum: [1, 60] }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RequestTimeout:
+      description: Request exceeded its configured deadline (request_timeout). Retry sends with the same idempotency key because a commit outcome can be ambiguous.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error:
+      description: Request failed. See error.code for the machine-readable category.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Registered:
+      description: The proposed credential has been adopted. Confirm ID, credential, and generation against the prepared request and persist acknowledgment atomically. Exact replay returns 200 and changes no state.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [installationId, installationToken, generation, status]
+            properties:
+              installationId: { type: string, format: uuid }
+              installationToken: { $ref: '#/components/schemas/InstallationCredential' }
+              generation: { $ref: '#/components/schemas/InstallationGeneration' }
+              status: { type: string, const: registered }

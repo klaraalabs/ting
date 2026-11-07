@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "description": "Credential names are test aliases. Consumers supply distinct canonical 32-byte credentials and native tokens before executing each scenario.",
+  "scenarios": [
+    {
+      "name": "lost creation response and native token change",
+      "steps": [
+        {"method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":201,"discardResponse":true},
+        {"method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":200,"restart":true},
+        {"method":"PUT","user":"alice","generation":2,"credential":"first","proposed":"first","push":"b","status":200},
+        {"method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":409,"error":"installation_superseded"},
+        {"method":"DELETE","generation":3,"credential":"first","status":204},
+        {"method":"PUT","user":"alice","generation":2,"credential":"first","proposed":"first","push":"b","status":409,"error":"installation_superseded"}
+      ],
+      "finalUser":"alice","finalCredential":"first","finalGeneration":3,"finalActive":false
+    },
+    {
+      "name": "lost account switch response and logout without identity JWT",
+      "steps": [
+        {"method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":201},
+        {"method":"PUT","user":"bob","generation":2,"credential":"first","proposed":"second","push":"a","status":200,"discardResponse":true},
+        {"method":"PUT","user":"bob","generation":2,"credential":"first","proposed":"second","push":"a","status":200,"restart":true},
+        {"method":"DELETE","generation":3,"credential":"first","status":401,"error":"installation_credential_invalid"},
+        {"method":"DELETE","generation":3,"credential":"second","status":204},
+        {"method":"DELETE","generation":3,"credential":"second","status":204,"restart":true},
+        {"method":"PUT","user":"bob","generation":2,"credential":"first","proposed":"second","push":"a","status":409,"error":"installation_superseded"}
+      ],
+      "finalUser":"bob","finalCredential":"second","finalGeneration":3,"finalActive":false
+    },
+    {
+      "name": "lost reactivation response followed by native token refresh",
+      "steps": [
+        {"method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":201},
+        {"method":"DELETE","generation":2,"credential":"first","status":204},
+        {"method":"PUT","user":"alice","generation":3,"credential":"first","proposed":"first","push":"a","status":400,"error":"invalid_request"},
+        {"method":"PUT","user":"alice","generation":3,"credential":"first","proposed":"second","push":"a","status":200,"discardResponse":true},
+        {"method":"PUT","user":"alice","generation":3,"credential":"first","proposed":"second","push":"a","status":200,"restart":true},
+        {"method":"PUT","user":"alice","generation":4,"credential":"second","proposed":"second","push":"b","status":200},
+        {"method":"DELETE","generation":2,"credential":"first","status":401,"error":"installation_credential_invalid"},
+        {"method":"DELETE","generation":2,"credential":"second","status":409,"error":"installation_superseded"}
+      ],
+      "finalUser":"alice","finalCredential":"second","finalGeneration":4,"finalActive":true
+    },
+    {
+      "name": "replay cannot claim another user or change a committed request",
+      "steps": [
+        {"method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":201},
+        {"method":"PUT","user":"mallory","generation":1,"proposed":"third","push":"a","status":401,"error":"installation_credential_invalid"},
+        {"method":"PUT","user":"bob","generation":1,"proposed":"first","push":"a","status":409,"error":"installation_generation_conflict"},
+        {"method":"PUT","user":"alice","generation":1,"proposed":"first","push":"b","status":409,"error":"installation_generation_conflict"},
+        {"method":"PUT","user":"alice","generation":2,"proposed":"first","push":"a","status":401,"error":"installation_credential_invalid"},
+        {"method":"DELETE","generation":1,"credential":"first","status":409,"error":"installation_generation_conflict"},
+        {"method":"PUT","user":"bob","generation":2,"credential":"first","proposed":"first","push":"a","status":400,"error":"invalid_request"}
+      ],
+      "finalUser":"alice","finalCredential":"first","finalGeneration":1,"finalActive":true
+    },
+    {
+      "name": "new login overtakes an unacknowledged initial registration",
+      "steps": [
+        {"method":"PUT","user":"bob","generation":3,"credential":"first","proposed":"second","push":"b","status":201},
+        {"method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":401,"error":"installation_credential_invalid"},
+        {"method":"DELETE","generation":2,"credential":"first","status":401,"error":"installation_credential_invalid"}
+      ],
+      "finalUser":"bob","finalCredential":"second","finalGeneration":3,"finalActive":true
+    }
+  ]
+}

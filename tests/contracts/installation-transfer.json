@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "description": "Run each scenario for iOS and Android in an isolated App. Installation, credential, and push values are aliases for distinct UUIDs, canonical random credentials, and native tokens. Restart recreates the server handler before the step. Final fan-out must target only bob.",
+  "scenarios": [
+    {
+      "name": "delayed higher-generation registration cannot undo a token transfer",
+      "steps": [
+        {"installation":"old","method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":201},
+        {"installation":"replacement","method":"PUT","user":"bob","generation":1,"proposed":"second","push":"a","status":201},
+        {"installation":"old","method":"PUT","user":"alice","generation":2,"credential":"first","proposed":"third","push":"a","status":409,"error":"installation_superseded","restart":true},
+        {"installation":"old","method":"PUT","user":"alice","generation":3,"credential":"first","proposed":"third","push":"b","status":409,"error":"installation_superseded"},
+        {"installation":"old","method":"DELETE","generation":4,"credential":"first","status":204},
+        {"installation":"replacement","method":"DELETE","generation":2,"credential":"second","status":204},
+        {"installation":"old","method":"PUT","user":"alice","generation":5,"credential":"first","proposed":"third","push":"a","status":409,"error":"installation_superseded","restart":true},
+        {"installation":"replacement","method":"PUT","user":"bob","generation":3,"credential":"second","proposed":"third","push":"a","status":200}
+      ],
+      "oldGeneration":4
+    },
+    {
+      "name": "token transfer fences a logged-out installation as well",
+      "steps": [
+        {"installation":"old","method":"PUT","user":"alice","generation":1,"proposed":"first","push":"a","status":201},
+        {"installation":"old","method":"DELETE","generation":2,"credential":"first","status":204},
+        {"installation":"replacement","method":"PUT","user":"bob","generation":1,"proposed":"second","push":"a","status":201},
+        {"installation":"old","method":"PUT","user":"alice","generation":3,"credential":"first","proposed":"third","push":"a","status":409,"error":"installation_superseded","restart":true},
+        {"installation":"old","method":"DELETE","generation":4,"credential":"first","status":204},
+        {"installation":"replacement","method":"DELETE","generation":2,"credential":"second","status":204},
+        {"installation":"old","method":"PUT","user":"alice","generation":5,"credential":"first","proposed":"third","push":"a","status":409,"error":"installation_superseded"},
+        {"installation":"replacement","method":"PUT","user":"bob","generation":3,"credential":"second","proposed":"third","push":"a","status":200}
+      ],
+      "oldGeneration":4
+    }
+  ]
+}

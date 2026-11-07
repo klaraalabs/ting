@@ -1,0 +1,6 @@
+.git
+bin
+.env
+*.pem
+*.p8
+*service-account*.json

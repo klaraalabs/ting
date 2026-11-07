@@ -1,0 +1,16 @@
+name: Swift SDK
+on:
+  push:
+    paths: ['Package.swift', 'sdks/swift/**', 'tests/contracts/**', '.github/workflows/swift.yaml']
+  pull_request:
+    paths: ['Package.swift', 'sdks/swift/**', 'tests/contracts/**', '.github/workflows/swift.yaml']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test
+      - name: Compile iOS adapter at the supported deployment minimum
+        run: xcodebuild -scheme Ting -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/ting-ios" CODE_SIGNING_ALLOWED=NO build
